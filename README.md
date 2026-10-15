@@ -1,199 +1,176 @@
-# bank-platform (Faz 5: ölçüm ve kaos)
+# bank-platform
 
-Faz 2'deki tek parça banka API'sinin servislere bölünmüş hali. Java 21, Spring Boot 3.3, Kafka, PostgreSQL.
+An event-driven core banking backend built as three microservices. Money moves between accounts through an orchestrated saga over Kafka, with a transactional outbox, idempotent processing, reconciliation, observability, load tests and chaos tests.
 
-| Servis | Port | Veritabanı | Görev |
+**Stack:** Java 21, Spring Boot 3.3, Spring Security (JWT), Spring Data JPA, Flyway, PostgreSQL 16, Apache Kafka, Micrometer / Prometheus / Grafana, OpenTelemetry / Tempo, Testcontainers, k6, Docker.
+
+| Service | Port | Database | Responsibility |
 |---|---|---|---|
-| account-service | 8081 | accountdb | müşteri, hesap, bakiye, ledger, giriş (JWT) |
-| transfer-service | 8082 | transferdb | transfer API'si, saga orkestratörü |
-| notification-service | 8083 | notificationdb | transfer sonucunu tüketir, bildirim üretir |
-| common | - | - | ortak sözleşmeler (komut/cevap/olay), outbox, JWT, hata modeli |
+| account-service | 8081 | accountdb | customers, accounts, balances, ledger, login (JWT) |
+| transfer-service | 8082 | transferdb | transfer API, saga orchestrator, cross-service reconciliation |
+| notification-service | 8083 | notificationdb | consumes transfer results and creates notifications |
+| common | - | - | shared contracts (commands/replies/events), outbox, JWT, error model |
 
-Her servis **kendi veritabanına** sahiptir; başka servisin tablosuna erişmez, FK yoktur. Servisler sadece Kafka ile konuşur.
+Each service owns its database: no shared tables, no foreign keys across services. Services talk to each other only through Kafka (plus one admin-only HTTP call used by reconciliation).
 
-## Saga (orkestrasyon)
+## Transfer saga
 
-transfer-service orkestratördür. Akış:
-
-```
-POST /api/transfers  ->  transfer kaydı (STARTED) + DEBIT komutu   (tek transaction, outbox)
-account-service: kaynak -> CLEARING hesabı   -> cevap
-transfer-service: DEBITED  + CREDIT komutu
-account-service: CLEARING -> hedef hesap     -> cevap
-transfer-service: COMPLETED + TransferEvent  -> notification-service
-```
-
-Hedef hesap reddederse (kapalı, para birimi farklı vb.): `COMPENSATING` -> REFUND komutu (CLEARING -> kaynak) -> `COMPENSATED`.
-İlk adım reddedilirse (yetersiz bakiye): `FAILED`, hiç para hareket etmemiştir.
-
-**Neden orkestrasyon, koreografi değil:** adım sırası ve telafi kuralı tek yerde yazılı; "bu transfer şu an nerede?" sorusunun cevabı
-tek satırda (`saga_state`); takılan saga bulunup kurtarılabilir. Koreografide bu bilgi servislerin olaylarına dağılır, para gibi kritik
-bir akışta izlenebilirlik hız kazancından önemlidir. Bedeli: orkestratör merkezi bir bileşendir (ama durumu DB'de olduğundan çökünce kaldığı yerden devam eder).
-
-**Para hiçbir an "havada" değil:** CLEARING (askı) hesabı sayesinde her commit'te tüm bakiyelerin toplamı 0'dır.
-Saga'lar bittiğinde clearing de 0'dır. `GET /api/admin/ledger-summary` (account-service) ikisini de gösterir.
-
-## Dayanıklılık mekanizmaları
-
-- **Transactional outbox:** durum değişimi ve gidecek mesaj aynı DB transaction'ında yazılır (çift yazma sorunu yok).
-- **Idempotent komut işleme:** account-service her komutu `operation_log` (`transferId:ADIM`) ile bir kez uygular; tekrar gelirse kayıtlı cevabı yeniden yollar.
-- **Recovery job:** bir adım `app.saga.step-timeout-ms` (15 sn) cevapsız kalırsa orkestratör o adımın komutunu yeniden gönderir.
-- **State machine:** beklenmeyen/tekrar eden/eski cevaplar yok sayılır.
-- **DLT + retry:** işlenemeyen mesaj 3 deneme sonra `<topic>.DLT`'ye gider.
-- **Idempotency-Key** (HTTP) ve **pessimistic lock** (hesaplar id sırasıyla kilitlenir, deadlock yok).
-
-## Çalıştırma
+transfer-service is the orchestrator:
 
 ```
-docker compose up -d                 # postgres (3 veritabanı) + kafka
-mvn clean verify                     # birim testleri + SagaSystemIT (Docker gerekir)
+POST /api/transfers -> transfer row (STARTED) + DEBIT command        (one transaction, outbox)
+account-service:      source account -> CLEARING account  -> reply
+transfer-service:     DEBITED  + CREDIT command
+account-service:      CLEARING account -> destination     -> reply
+transfer-service:     COMPLETED + TransferEvent -> notification-service
+```
+
+If the destination rejects the credit (closed account, currency mismatch, ...): `COMPENSATING` -> REFUND command (CLEARING -> source) -> `COMPENSATED`.
+If the first step is rejected (insufficient funds): `FAILED`, no money has moved.
+
+**Why orchestration instead of choreography:** step order and compensation rules live in one place, and "where is this transfer right now?" is answered by a single column (`saga_state`). Stuck sagas can be found and recovered. The cost is a central component, but its state is in the database, so after a crash it resumes where it stopped.
+
+**Money is never "in the air":** a clearing (suspense) account per currency means the sum of all balances is 0 at every commit. When all sagas finish, the clearing balance is 0 as well. `GET /api/admin/ledger-summary` (account-service) shows both.
+
+## Reliability mechanisms
+
+- **Transactional outbox:** the state change and the outgoing message are written in the same DB transaction (no dual-write problem). A relay publishes them to Kafka with at-least-once delivery.
+- **Idempotent command handling:** account-service applies each command once, keyed by `operation_log` (`transferId:STEP`); a duplicate gets the recorded reply again.
+- **Idempotent consumers** (notification-service) and an HTTP **`Idempotency-Key`** for transfer creation.
+- **Recovery job:** if a step gets no reply within `app.saga.step-timeout-ms`, the orchestrator re-sends that step's command.
+- **State machine:** unexpected, duplicate or stale replies are ignored.
+- **Retry + dead letter topics:** failing messages are retried with exponential backoff (1 s up to 32 s, about a minute in total), then published to `<topic>.DLT`.
+- **Pessimistic locking** with accounts locked in id order, so concurrent transfers cannot deadlock.
+
+## Running
+
+```
+docker compose up -d                 # postgres (3 databases), kafka, prometheus, grafana, tempo
+mvn clean verify                     # unit tests + integration tests (Docker required)
 mvn -pl account-service spring-boot:run
 mvn -pl transfer-service spring-boot:run
 mvn -pl notification-service spring-boot:run
 ```
 
-Swagger: `http://localhost:8081/swagger-ui.html` (account), `8082` (transfer), `8083` (notification).
-Giriş: `POST /api/auth/login` (admin `Admin123!`, teller `Teller123!`; production'da env ile değiştir). Token üç serviste de geçerlidir.
-Transfer: `POST /api/transfers` (`Idempotency-Key` zorunlu, `?wait=10000` sonuçlanmasını bekler); sonuç `GET /api/transfers/{id}`.
+Swagger UI: `http://localhost:8081/swagger-ui.html` (account), `8082` (transfer), `8083` (notification).
+Login: `POST /api/auth/login` (admin `Admin123!`, teller `Teller123!`; override via environment in any real deployment). The token is valid on all three services.
+Transfers: `POST /api/transfers` (requires an `Idempotency-Key` header; `?wait=10000` waits for the outcome); read the result with `GET /api/transfers/{id}`.
 
-## Testler
+To run the services themselves as containers (used by the chaos tests):
 
-`integration-tests/SagaSystemIT` (üç servis aynı JVM'de, gerçek Postgres + Kafka, Testcontainers):
+```
+docker compose --profile apps up -d --build
+# optional, so Prometheus scrapes the containers:  PROM_CONFIG=./docker/prometheus/prometheus-containers.yml
+```
 
-- mutlu yol + bildirimler,
-- yetersiz bakiye (FAILED, para hareket etmez),
-- hedef hesap kapalı -> telafi (COMPENSATED, para geri gelir),
-- **account-service saga ortasında çöküyor** -> para clearing'de güvende, yeniden başlayınca saga tamamlanır,
-- **transfer-service adımlar arasında çöküyor** -> DB'deki durumdan devam eder,
-- takılan adım tekrar gönderilir, çift komut **bir kez** uygulanır,
-- aynı Idempotency-Key ikinci saga başlatmaz,
-- başkasının hesabından harcama reddedilir.
+The root `Dockerfile` is a single multi-stage file (`--build-arg SERVICE=account-service|transfer-service|notification-service`). Kafka exposes two listeners: `kafka:19092` for containers and `localhost:9092` for the host.
 
-Her testin sonunda: Σ bakiye = 0 ve clearing = 0.
+## Tests
 
-## Bilinen sınırlar
+`integration-tests` runs all three services in one JVM against real PostgreSQL and Kafka (Testcontainers).
 
-- Henüz **derlenmedi / çalıştırılmadı** (geliştirme ortamında Maven ve Docker yoktu): ilk `mvn verify`'da küçük hatalar çıkabilir.
-- Cevap hiç gelmezse saga sonsuza dek tekrar dener (abort/fencing yok).
-- Clearing hesabı para birimi başına tek satırdır: yüksek yükte sıcak satır (Faz 5'te ölçülecek).
-- Telafi (iade) kapalı hesaba bile yapılır.
-- Testcontainers + çok yeni Docker (29+) sürümlerinde API uyumsuzluğu olabilir; olursa Testcontainers sürümünü yükselt.
-- JWT HMAC ortak anahtar; gerçekte RS256 + secret manager.
+`SagaSystemIT`:
+- happy path and notifications
+- insufficient funds (FAILED, no money moves)
+- closed destination account -> compensation (COMPENSATED, money returns)
+- **account-service crashes mid-saga** -> money is safe in clearing, saga completes after restart
+- **transfer-service crashes between steps** -> resumes from the persisted state
+- a stuck step is re-sent; duplicate commands are applied **once**
+- the same `Idempotency-Key` does not start a second saga
+- spending from someone else's account is rejected
 
-## Metrikler (Faz 4.1)
+`ReconciliationIT`: a healthy system has no findings; deliberately tampered data is detected.
 
-`docker compose up -d` artık Prometheus (http://localhost:9090) ve Grafana (http://localhost:3000, admin/admin; "Bank Platform" dashboard'u hazır gelir) da başlatır.
-Servisler host'ta çalışır; Prometheus `host.docker.internal:8081-8083/actuator/prometheus` adreslerini her 10 sn scrape eder.
+After every test: sum of balances = 0 and clearing = 0. Unit tests cover the saga state machine, the outbox relay and the reconciliation evaluator.
 
-**İş metrikleri** (hepsi `application`/`service` etiketli):
+## Metrics
 
-| Metrik | Anlamı |
+Prometheus (`http://localhost:9090`) and Grafana (`http://localhost:3000`, admin/admin, "Bank Platform" dashboard provisioned) start with `docker compose up -d`. Prometheus scrapes `/actuator/prometheus` of each service every 10 s.
+
+| Metric | Meaning |
 |---|---|
-| `ledger_total_balance` | Tüm bakiyelerin toplamı. Daima 0 olmalı |
-| `ledger_clearing_balance{currency}` | Yoldaki para. Saga'lar bitince 0 |
-| `saga_in_flight{state}` | Duruma göre transfer sayısı |
+| `ledger_total_balance` | Sum of all balances. Must always be 0 |
+| `ledger_clearing_balance{currency}` | Money in flight. 0 once sagas finish |
+| `saga_in_flight{state}` | Transfers per state |
 | `saga_completed_total{outcome,type}` | completed / failed / compensated |
-| `saga_duration_seconds` | Transferin başlangıcından sonucuna süre (histogram) |
-| `saga_step_retries_total{step}` | Recovery job'ın yeniden gönderdiği adımlar |
+| `saga_duration_seconds` | Time from transfer start to outcome (histogram) |
+| `saga_step_retries_total{step}` | Steps re-sent by the recovery job |
 | `account_commands_total{step,result}` | success / rejected / duplicate / error |
-| `outbox_pending`, `outbox_oldest_pending_age_seconds` | Outbox birikmesi |
-| `outbox_published_total`, `outbox_publish_failures_total` | Yayın sayaçları |
-| `kafka_dlt_published_total{source_topic}` | DLT'ye düşen mesajlar |
+| `outbox_pending`, `outbox_oldest_pending_age_seconds` | Outbox backlog |
+| `outbox_published_total`, `outbox_publish_failures_total` | Relay counters |
+| `kafka_dlt_published_total{source_topic}` | Messages sent to a dead letter topic |
 | `notification_events_total{result}` | processed / duplicate |
+| `reconciliation_*` | Reconciliation violations and open findings |
 
-Hazır teknik metrikler: HTTP (histogram), JVM, Hikari bağlantı havuzu, Kafka consumer lag.
+Also available: HTTP histograms, JVM, Hikari pool, Kafka consumer lag.
 
-**Alarm kuralları** (`docker/prometheus/alerts.yml`): LedgerInvariantBroken, ClearingNotDrained, SagaStuck, SagaRetriesHigh,
-SagaCompensationSpike, DeadLetterMessages, OutboxBacklog, OutboxPublishFailures, ServiceDown, HighServerErrorRate, SlowRequests,
-DbConnectionPoolSaturated. Prometheus arayüzünde Alerts sekmesinde görünür (bildirim kanalı bağlı değil).
+**Alert rules** (`docker/prometheus/alerts.yml`): LedgerInvariantBroken, ClearingNotDrained, SagaStuck, SagaRetriesHigh, SagaCompensationSpike, DeadLetterMessages, OutboxBacklog, OutboxPublishFailures, ReconciliationMismatch, ServiceDown, HighServerErrorRate, SlowRequests, DbConnectionPoolSaturated. They are visible in the Prometheus UI (no notification channel is wired up).
 
-Notlar: `/actuator/prometheus` ve `/actuator/health` kimlik doğrulamasız açıktır (Prometheus token taşımaz); production'da bu uçlar iç ağda kalmalıdır.
+## Distributed tracing
 
-## Dağıtık izleme (Faz 4.2)
-
-Tek bir transfer HTTP isteğinden başlar; Kafka üzerinden üç serviste, 3-4 hop boyunca ilerler. Tek bir **trace** olarak görünür:
+One transfer starts as an HTTP request and travels through three services over several Kafka hops, yet shows up as a single trace:
 
 ```
 POST /api/transfers (transfer-service) -> outbox publish -> account-service: debit -> outbox publish
   -> transfer-service: reply -> outbox publish -> account-service: credit -> ... -> notification-service
 ```
 
-- **Stack:** Micrometer Tracing -> OpenTelemetry -> OTLP/HTTP -> **Tempo** -> Grafana. `docker compose up -d` Tempo'yu da başlatır (4318: OTLP, 3200: Tempo API).
-- **Kafka üzerinden taşıma:** `spring.kafka.template/listener.observation-enabled`. Producer, trace context'ini (W3C `traceparent`) mesaj header'ına yazar; tüketici aynı trace'te devam eder.
-- **Outbox'ta kopmayan iz:** mesaj, onu üreten isteğin thread'inde değil, outbox publisher'ında (başka thread, sonra) yayınlanır; normalde iz burada kopardı.
-  Bu yüzden `outbox_event.traceparent` kolonu mesajla birlikte yazılır, publisher "outbox publish" span'ını bu context'in çocuğu olarak açar.
-- **İş etiketleri:** span'larda `transfer.id`, `saga.state`, `saga.step`, `command.result` var.
-  Grafana -> Explore -> Tempo -> TraceQL: `{ span.transfer.id = "42" }` ile bir transferin bütün izi bulunur.
-- **Log korelasyonu:** her log satırı `[servis, traceId, spanId]` taşır. Bir trace'in traceId'si ile loglarda arama yapılır (merkezi log toplama bu fazda yok: Loki/ELK ayrı bir adım).
-- **Örnekleme:** dev'de `TRACING_SAMPLING=1.0`; production'da `0.05-0.1` önerilir. Entegrasyon testlerinde 0.0 (Tempo yok, context yine yayılır).
-- Tempo ayakta değilse servisler çalışmaya devam eder, sadece export uyarısı loglar.
+- **Stack:** Micrometer Tracing -> OpenTelemetry -> OTLP/HTTP -> Tempo -> Grafana (OTLP on 4318, Tempo API on 3200).
+- **Across Kafka:** producers write the W3C `traceparent` into message headers; consumers continue the same trace.
+- **Across the outbox:** messages are published later by a different thread, which would normally break the trace. The `outbox_event.traceparent` column stores the context with the message, and the relay opens its "outbox publish" span as a child of it.
+- **Business tags:** spans carry `transfer.id`, `saga.state`, `saga.step`, `command.result`. In Grafana -> Explore -> Tempo: `{ span.transfer.id = "42" }` finds the whole trace of one transfer.
+- **Log correlation:** every log line carries `[service, traceId, spanId]`.
+- **Sampling:** `TRACING_SAMPLING=1.0` in dev, `0.05-0.1` suggested for production, `0.0` in integration tests.
 
-**Ne işe yarar (örnek):** "Bu transfer neden 8 saniye sürdü?" -> trace'te hangi adımın (debit komutu Kafka'da mı bekledi, outbox mu geç yayınladı, credit mi yavaş)
-uzadığı süre çubuklarında görünür; `saga_duration_seconds` yavaşlığı gösterir, trace nedenini gösterir.
+## Reconciliation
 
-## Faz 4 sonrası sınırlar
+Tests show that no money is lost in known scenarios; reconciliation keeps asking, on a live system, whether the money is still right. Two layers:
 
-- Henüz **derlenmedi / çalıştırılmadı**. İlk çalıştırmada Boot/OTel sürüm uyumsuzlukları veya küçük derleme hataları çıkabilir.
-- Actuator uçları kimlik doğrulamasız; production'da iç ağda tutulmalı.
-- Alarmlar yalnızca Prometheus'ta görünür (Alertmanager/Slack bağlantısı yok).
-- Merkezi log toplama (Loki/ELK) yok; sadece traceId korelasyonu hazır.
+**1) account-service, its own books** (`LedgerReconciliationService`, every 5 minutes and `GET /api/admin/reconciliation`), inside one REPEATABLE READ snapshot:
 
-## Mutabakat / reconciliation (Faz 5.1)
-
-Testler "bu senaryolarda para kaybolmadı"yı gösterir; mutabakat ise **canlı sistemde sürekli** "para hâlâ doğru mu?" diye sorar.
-İki katman:
-
-**1) account-service: kendi muhasebesi** (`LedgerReconciliationService`, 5 dakikada bir + `GET /api/admin/reconciliation`).
-Tek bir REPEATABLE READ snapshot'ında:
-
-| Kontrol | Anlamı |
+| Check | Meaning |
 |---|---|
-| `TOTAL_NOT_ZERO` | Tüm bakiyelerin toplamı 0 değil |
-| `BALANCE_LEDGER_MISMATCH` | Bir hesabın bakiyesi ledger'daki CREDIT-DEBIT toplamına eşit değil |
-| `ENTRY_WITHOUT_OPERATION` | Başarılı işlem kaydı olmayan ledger kaydı |
-| `OPERATION_ENTRY_COUNT` | Başarılı işlem tam 2 ledger kaydı üretmemiş |
-| `OPERATION_NOT_BALANCED` | Bir işlemin ledger kayıtları sıfıra toplanmıyor |
+| `TOTAL_NOT_ZERO` | Sum of all balances is not 0 |
+| `BALANCE_LEDGER_MISMATCH` | An account balance differs from its ledger CREDIT - DEBIT total |
+| `ENTRY_WITHOUT_OPERATION` | Ledger entry without a successful operation record |
+| `OPERATION_ENTRY_COUNT` | A successful operation did not produce exactly 2 ledger entries |
+| `OPERATION_NOT_BALANCED` | An operation's ledger entries do not sum to zero |
 
-**2) Servisler arası** (`ReconciliationService`, transfer-service, dakikada bir): bitmiş her transferin sonucu, account-service'in işlem kayıtlarıyla karşılaştırılır:
+**2) Cross-service** (`ReconciliationService` in transfer-service, every minute): the outcome of each finished transfer is compared with account-service's operation records.
 
-| transfer sonucu | account-service'te beklenen |
+| Transfer outcome | Expected in account-service |
 |---|---|
-| COMPLETED | DEBIT başarılı, CREDIT başarılı, REFUND yok |
-| COMPENSATED | DEBIT başarılı, CREDIT reddedilmiş, REFUND başarılı |
-| FAILED | DEBIT reddedilmiş, CREDIT ve REFUND yok |
+| COMPLETED | DEBIT succeeded, CREDIT succeeded, no REFUND |
+| COMPENSATED | DEBIT succeeded, CREDIT rejected, REFUND succeeded |
+| FAILED | DEBIT rejected, no CREDIT, no REFUND |
 
-Uyuşmazlık `reconciliation_finding` tablosuna yazılır ve bir insan `POST /api/admin/reconciliation/findings/{id}/resolve` diyene kadar açık kalır
-(`reconciliation_findings_open` metriği, `ReconciliationMismatch` alarmı). En tehlikeli durum `FAILED_BUT_DEBITED` (başarısız görünen transferde para çıkmış).
-Her transfer bir kez kontrol edilir (`reconciled_at`); account-service erişilemezse tur atlanır, sonra tekrar denenir. `POST /api/admin/reconciliation/run` turu elle tetikler.
+Mismatches are written to `reconciliation_finding` and stay open until a human calls `POST /api/admin/reconciliation/findings/{id}/resolve`. The most dangerous kind is `FAILED_BUT_DEBITED`. Each transfer is checked once (`reconciled_at`); if account-service is unreachable the round is skipped and retried. `POST /api/admin/reconciliation/run` triggers a round manually.
 
-**Testler:** `ReconciliationEvaluatorTest` (10 birim testi, saf mantık) ve `ReconciliationIT`: sağlıklı sistemde bulgu yok;
-veri kasten bozulunca (başarısız transferi "tamamlandı" yapmak, bakiyeye +5 eklemek, işlem kaydı olmayan ledger kaydı eklemek) mutabakat bunu **yakalıyor**.
+The service-to-service call uses a short-lived ADMIN token minted from the shared JWT key (a demo shortcut; use mTLS or a service account in reality).
 
-Not: servisler arası çağrı için transfer-service ortak JWT anahtarıyla kısa ömürlü bir ADMIN token üretir (gösterim için; gerçekte mTLS/servis hesabı).
+## Load tests
 
-Sıradaki: 5.2 k6 yük testleri, 5.3 servisleri çökertme senaryoları ve README'ye gerçek sayılar.
+k6 scenarios live in `load-tests/` (steady, ramp, spike, hot account, idempotency). At the end of every run the test verifies automatically that the sum of balances is 0, the clearing balance is 0, no sagas are pending, the ledger checks pass and reconciliation is clean. If any of these fails, the test fails. See `load-tests/README.md`.
 
-## Yük testleri (Faz 5.2)
+## Chaos tests
 
-`load-tests/` altında k6 senaryoları (steady, ramp, spike, hot, idempotency). Her çalıştırma sonunda otomatik olarak
-Σ bakiye = 0, clearing = 0, bekleyen saga yok, muhasebe kontrolü ve mutabakat temiz mi diye doğrulanır; biri tutmazsa test başarısızdır.
-Ayrıntılar: `load-tests/README.md`. Sıradaki: 5.3 (servisleri yük altında çökertme, Dockerfile'lar, README'ye gerçek sayılar).
-
-## Kaos testleri (Faz 5.3)
-
-Servisleri container olarak çalıştırıp yük altındayken öldürür; sonunda k6 teardown'u para değişmezlerini doğrular.
+The chaos scripts run a steady k6 load against the containerized services and kill or freeze something in the middle; the k6 teardown then verifies the money invariants.
 
 ```
-docker compose --profile apps up -d --build        # postgres, kafka, 3 servis, prometheus, tempo, grafana
-# (isteğe bağlı) Prometheus container hedefleri için: $env:PROM_CONFIG="./docker/prometheus/prometheus-containers.yml"
+docker compose --profile apps up -d --build
 cd chaos
-.\chaos.ps1 -Fault kill-account                    # Linux/macOS: ./chaos.sh kill-account
+.\chaos.ps1 -Fault kill-account        # Linux/macOS: ./chaos.sh kill-account
 ```
 
-Senaryolar: `kill-account`, `kill-transfer`, `kill-notification`, `kill-all`, `rolling`, `pause-kafka`, `stop-kafka`, `restart-postgres`.
-Ayrıntı ve beklenen davranış: [chaos/README.md](chaos/README.md). `CHAOS=1` modunda gecikme/hız eşikleri kapalıdır;
-`invariant_violations`, `reconciliation_findings`, `idempotency_violations` eşikleri açık kalır.
+Scenarios: `kill-account`, `kill-transfer`, `kill-notification`, `kill-all`, `rolling`, `pause-kafka`, `stop-kafka`, `restart-postgres`. Expected behavior per scenario: [chaos/README.md](chaos/README.md).
+With `CHAOS=1` the latency and throughput thresholds are disabled; `invariant_violations`, `reconciliation_findings` and `idempotency_violations` stay enforced.
 
-Docker: kökteki `Dockerfile` tek bir çok aşamalı dosyadır (`--build-arg SERVICE=account-service|transfer-service|notification-service`).
-Kafka iki listener'a sahiptir: container'lar `kafka:19092`, host `localhost:9092`.
-Retry: tüketici hata işleyicisi 1→32 sn üstel bekleme ile ~1 dk dener (DB kesintisi DLT'ye düşürmesin); takılan adımı recovery job zaten yeniden gönderir.
+## Known limitations
+
+- If a reply never arrives, the saga retries forever (no abort, no fencing of late replies).
+- The clearing account is a single row per currency, so it is a hot row under heavy load.
+- Compensation (refund) credits the source account even if it has been closed since.
+- JWT uses a shared HMAC key; use RS256 and a secret manager in production.
+- Actuator endpoints are unauthenticated; keep them on an internal network.
+- Alerts only appear in Prometheus (no Alertmanager/Slack); no central log aggregation, only traceId correlation.
+- Testcontainers may have API incompatibilities with very new Docker versions (29+); upgrade Testcontainers if that happens.
