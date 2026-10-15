@@ -1,0 +1,132 @@
+# Alarm kuralları. Önem sırası: para bütünlüğü > takılan işlem > altyapı sağlığı.
+groups:
+  - name: money-integrity
+    rules:
+      - alert: LedgerInvariantBroken
+        expr: abs(ledger_total_balance) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Tüm bakiyelerin toplamı 0 değil ({{ $value }})"
+          description: "Para yoktan var olmuş veya kaybolmuş olabilir. Hemen ledger'ı incele (GET /api/admin/ledger-summary)."
+
+      - alert: ClearingNotDrained
+        expr: sum(ledger_clearing_balance) != 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Clearing hesabında 5 dakikadır para bekliyor"
+          description: "Yolda kalan saga olabilir. saga_in_flight ve transfer tablosuna bak."
+
+  - name: saga
+    rules:
+      - alert: SagaStuck
+        expr: sum(saga_in_flight{state=~"STARTED|DEBITED|COMPENSATING"}) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Bitmemiş saga var ({{ $value }}) ve 2 dakikadır azalmıyor"
+          description: "Recovery job her 5 sn takılanları yeniden tetikler; geçmiyorsa account-service veya Kafka sorunlu."
+
+      - alert: SagaRetriesHigh
+        expr: sum(rate(saga_step_retries_total[5m])) > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Saga adımları sürekli yeniden gönderiliyor"
+
+      - alert: SagaCompensationSpike
+        expr: sum(rate(saga_completed_total{outcome="compensated"}[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Telafi edilen transfer oranı yüksek"
+          description: "Hedef hesaplar sık reddediyor olabilir (kapalı hesap, para birimi hatası)."
+
+  - name: messaging
+    rules:
+      - alert: DeadLetterMessages
+        expr: sum(increase(kafka_dlt_published_total[10m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Dead letter topic'ine mesaj düştü"
+          description: "İşlenemeyen mesaj var: {{ $labels.source_topic }}. .DLT topic'ini incele."
+
+      - alert: OutboxBacklog
+        expr: max by (service) (outbox_oldest_pending_age_seconds) > 60
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} outbox'ında 60 sn'den eski bekleyen mesaj var"
+          description: "Kafka erişilemiyor veya publisher takılmış olabilir."
+
+      - alert: OutboxPublishFailures
+        expr: sum by (service) (rate(outbox_publish_failures_total[2m])) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} Kafka'ya yayın yapamıyor"
+
+  - name: platform
+    rules:
+      - alert: ServiceDown
+        expr: up{job="bank-services"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.service }} erişilemiyor"
+
+      - alert: HighServerErrorRate
+        expr: |
+          sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+            / sum by (service) (rate(http_server_requests_seconds_count[5m])) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} isteklerinin %5'inden fazlası 5xx"
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95, sum by (service, le) (rate(http_server_requests_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} p95 gecikme 1 saniyenin üstünde"
+
+      - alert: DbConnectionPoolSaturated
+        expr: hikaricp_connections_active / hikaricp_connections_max > 0.9
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service }} veritabanı bağlantı havuzu dolmak üzere"
+
+  - name: reconciliation
+    rules:
+      - alert: ReconciliationMismatch
+        expr: sum(reconciliation_findings_open) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Açık mutabakat bulgusu var ({{ $value }})"
+          description: "Transfer sonucu ile account-service kayıtları uyuşmuyor. GET /api/admin/reconciliation (transfer-service) ile bulguları incele."
+
+      - alert: LedgerViolations
+        expr: max(reconciliation_account_violations) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Muhasebe kontrolü ihlal buldu"
+          description: "Bakiye/ledger/işlem kaydı tutarsız. GET /api/admin/reconciliation (account-service) raporuna bak."
+
+      - alert: ReconciliationErrors
+        expr: sum(rate(reconciliation_runs_total{result="error"}[10m])) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Mutabakat turları 15 dakikadır çalışamıyor"
+          description: "account-service erişilemiyor olabilir; bu sürede bitmiş transferler kontrol edilmiyor."
+
+      - alert: ReconciliationBacklog
+        expr: sum(reconciliation_unreconciled) > 500
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Mutabakatı yapılmamış çok sayıda transfer birikti"

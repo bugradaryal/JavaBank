@@ -1,17 +1,20 @@
 services:
+  # Tek PostgreSQL sunucusu, her servis için ayrı veritabanı (docker/init-databases.sql oluşturur).
+  # Servisler birbirinin veritabanına erişmez; sadece Kafka üzerinden konuşurlar.
   postgres:
     image: postgres:16-alpine
     container_name: bank-postgres
     environment:
-      POSTGRES_DB: bankdb
+      POSTGRES_DB: postgres
       POSTGRES_USER: bank
       POSTGRES_PASSWORD: bank
     ports:
       - "5432:5432"
     volumes:
       - bank-pgdata:/var/lib/postgresql/data
+      - ./docker/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bank -d bankdb"]
+      test: ["CMD-SHELL", "pg_isready -U bank -d postgres"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -22,11 +25,113 @@ services:
     container_name: bank-kafka
     ports:
       - "9092:9092"
+    environment:
+      # İki dinleyici: host'ta çalışan servisler localhost:9092, container'daki servisler kafka:19092 kullanır.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
       interval: 10s
       timeout: 10s
       retries: 10
 
+  # --- Observability (Faz 4) ---
+  # Servisler host'ta çalışır; Prometheus onları host.docker.internal üzerinden scrape eder.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: bank-prometheus
+    # k6 metriklerini remote-write ile alabilsin diye receiver açık (diğer bayraklar varsayılan).
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-remote-write-receiver"
+    ports:
+      - "9090:9090"
+    volumes:
+      # Servisler container'daysa: PROM_CONFIG=./docker/prometheus/prometheus-containers.yml
+      - ${PROM_CONFIG:-./docker/prometheus/prometheus.yml}:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Dağıtık izleme: servisler OTLP/HTTP ile 4318'e trace yollar, Grafana Tempo'dan okur.
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: bank-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "4318:4318"   # OTLP/HTTP (servisler)
+      - "3200:3200"   # Tempo API (Grafana)
+    volumes:
+      - ./docker/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - bank-tempodata:/var/tempo
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: bank-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - tempo
+
+  # --- Uygulamalar (isteğe bağlı): docker compose --profile apps up -d --build ---
+  # Kaos testleri servisleri `docker kill` ile öldürebilsin diye container olarak çalıştırılır.
+  # restart: "no" -> öldürülen servis, siz başlatana kadar kapalı kalır.
+  account-service:
+    profiles: ["apps"]
+    build: { context: ., args: { SERVICE: account-service } }
+    container_name: bank-account-service
+    restart: "no"
+    ports: ["8081:8081"]
+    environment: &app-env
+      ACCOUNT_DB_URL: jdbc:postgresql://postgres:5432/accountdb
+      TRANSFER_DB_URL: jdbc:postgresql://postgres:5432/transferdb
+      NOTIFICATION_DB_URL: jdbc:postgresql://postgres:5432/notificationdb
+      KAFKA_BOOTSTRAP: kafka:19092
+      OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+      ACCOUNT_SERVICE_URL: http://account-service:8081
+      TRACING_SAMPLING: "0.1"
+    depends_on: &app-deps
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  transfer-service:
+    profiles: ["apps"]
+    build: { context: ., args: { SERVICE: transfer-service } }
+    container_name: bank-transfer-service
+    restart: "no"
+    ports: ["8082:8082"]
+    environment: *app-env
+    depends_on: *app-deps
+
+  notification-service:
+    profiles: ["apps"]
+    build: { context: ., args: { SERVICE: notification-service } }
+    container_name: bank-notification-service
+    restart: "no"
+    ports: ["8083:8083"]
+    environment: *app-env
+    depends_on: *app-deps
+
 volumes:
   bank-pgdata:
+  bank-tempodata:
